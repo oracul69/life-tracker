@@ -1,0 +1,538 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+// ----- Notification setup -----
+
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+    FlutterLocalNotificationsPlugin();
+
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize local notifications
+  const AndroidInitializationSettings initializationSettingsAndroid =
+      AndroidInitializationSettings('@mipmap/ic_launcher');
+
+  const DarwinInitializationSettings initializationSettingsIOS =
+      DarwinInitializationSettings();
+
+  const InitializationSettings initializationSettings =
+      InitializationSettings(
+    android: initializationSettingsAndroid,
+    iOS: initializationSettingsIOS,
+  );
+
+  await flutterLocalNotificationsPlugin.initialize(
+    initializationSettings,
+    onDidReceiveNotificationResponse: (NotificationResponse response) {
+      // When user taps the notification – open mood dialog for today
+      navigatorKey.currentState?.push(
+        MaterialPageRoute(
+          builder: (context) => MoodForTodayScreen(),
+        ),
+      );
+    },
+  );
+
+  // Schedule daily notification (if not already scheduled)
+  await _scheduleDailyReminderNotification();
+
+  runApp(const LifeTrackerApp());
+}
+
+Future<void> _scheduleDailyReminderNotification() async {
+  const AndroidNotificationDetails androidDetails =
+      AndroidNotificationDetails(
+    'daily_mood_channel',
+    'Daily Mood Reminder',
+    channelDescription: 'Daily reminder to log your mood',
+    importance: Importance.max,
+    priority: Priority.high,
+  );
+
+  const DarwinNotificationDetails iosDetails = DarwinNotificationDetails();
+
+  const NotificationDetails platformDetails =
+      NotificationDetails(android: androidDetails, iOS: iosDetails);
+
+  // Set time (here: 20:00 / 8 PM) – change as you like
+  final TimeOfDay timeOfDay = const TimeOfDay(hour: 20, minute: 0);
+  final now = DateTime.now();
+  final firstNotificationTime = DateTime(
+    now.year,
+    now.month,
+    now.day,
+    timeOfDay.hour,
+    timeOfDay.minute,
+  ).add(now.isAfter(DateTime(
+          now.year, now.month, now.day, timeOfDay.hour, timeOfDay.minute))
+      ? const Duration(days: 1)
+      : Duration.zero);
+
+  // Use zonedSchedule in a real app; for simplicity we use showDailyAtTime-style logic
+  await flutterLocalNotificationsPlugin.zonedSchedule(
+    0,
+    'How was your day?',
+    'Tap to log your mood for today.',
+    firstNotificationTime.toLocal().toUtc(), // simplified
+    platformDetails,
+    uiLocalNotificationDateInterpretation:
+        UILocalNotificationDateInterpretation.absoluteTime,
+    androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+    matchDateTimeComponents: DateTimeComponents.time,
+  );
+}
+
+// ----- App root -----
+
+class LifeTrackerApp extends StatelessWidget {
+  const LifeTrackerApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      navigatorKey: navigatorKey,
+      title: 'Life Tracker',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueGrey),
+        useMaterial3: true,
+      ),
+      home: const HomeScreen(),
+    );
+  }
+}
+
+// ----- Models & helpers -----
+
+enum Mood { terrible, bad, ok, good, great }
+
+Color moodToColor(Mood mood) {
+  switch (mood) {
+    case Mood.terrible:
+      return Colors.red.shade800;
+    case Mood.bad:
+      return Colors.orange.shade700;
+    case Mood.ok:
+      return Colors.yellow.shade600;
+    case Mood.good:
+      return Colors.lightGreen.shade600;
+    case Mood.great:
+      return Colors.green.shade800;
+  }
+}
+
+String moodToLabel(Mood mood) {
+  switch (mood) {
+    case Mood.terrible:
+      return 'Terrible';
+    case Mood.bad:
+      return 'Bad';
+    case Mood.ok:
+      return 'Okay';
+    case Mood.good:
+      return 'Good';
+    case Mood.great:
+      return 'Great';
+  }
+}
+
+Mood intToMood(int value) => Mood.values[value];
+int moodToInt(Mood mood) => mood.index;
+
+// ----- Persistent storage keys -----
+
+const String _birthDateKey = 'birth_date';
+const String _moodsKey = 'moods_json';
+
+// moodsJson format: { "YYYY-MM-DD": moodIndex, ... }
+
+// ----- Home Screen -----
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  DateTime? _birthDate;
+  Map<String, int> _moods = {};
+  bool _loading = true;
+
+  static const int expectedLifespanYears = 80;
+  static int get expectedLifespanDays => expectedLifespanYears * 365;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadData();
+  }
+
+  Future<void> _loadData() async {
+    final prefs = await SharedPreferences.getInstance();
+    final birthDateString = prefs.getString(_birthDateKey);
+    final moodsJson = prefs.getString(_moodsKey);
+
+    DateTime? birthDate;
+    if (birthDateString != null) {
+      birthDate = DateTime.tryParse(birthDateString);
+    }
+
+    Map<String, int> moods = {};
+    if (moodsJson != null) {
+      try {
+        final decoded = jsonDecode(moodsJson) as Map<String, dynamic>;
+        for (final entry in decoded.entries) {
+          moods[entry.key] = entry.value as int;
+        }
+      } catch (_) {
+        // ignore parse errors
+      }
+    }
+
+    setState(() {
+      _birthDate = birthDate;
+      _moods = moods;
+      _loading = false;
+    });
+  }
+
+  Future<void> _saveBirthDate(DateTime date) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_birthDateKey, date.toIso8601String());
+    setState(() {
+      _birthDate = date;
+    });
+  }
+
+  Future<void> _saveMoods() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_moodsKey, jsonEncode(_moods));
+  }
+
+  int get livedDays {
+    if (_birthDate == null) return 0;
+    final now = DateTime.now();
+    return now.difference(_birthDate!).inDays + 1;
+  }
+
+  double get lifeProgress {
+    if (_birthDate == null) return 0;
+    return livedDays / expectedLifespanDays;
+  }
+
+  String _formatDate(DateTime date) =>
+      DateFormat('yyyy-MM-dd').format(date);
+
+  void _openMoodDialogForDate(DateTime date) async {
+    final key = _formatDate(date);
+    final currentMoodIndex = _moods[key];
+    final currentMood =
+        currentMoodIndex != null ? intToMood(currentMoodIndex) : Mood.ok;
+
+    final result = await showDialog<Mood>(
+      context: context,
+      builder: (context) => MoodDialog(
+        initialMood: currentMood,
+        date: date,
+      ),
+    );
+
+    if (result != null) {
+      setState(() {
+        _moods[key] = moodToInt(result);
+      });
+      await _saveMoods();
+    }
+  }
+
+  Future<void> _pickBirthDate() async {
+    final now = DateTime.now();
+    final earliest = DateTime(now.year - 120, now.month, now.day);
+    final latest = now;
+
+    final picked = await showDatePicker(
+      context: context,
+      firstDate: earliest,
+      lastDate: latest,
+      initialDate: DateTime(now.year - 20),
+    );
+
+    if (picked != null) {
+      await _saveBirthDate(picked);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Life Tracker'),
+      ),
+      floatingActionButton: _birthDate == null
+          ? null
+          : FloatingActionButton.extended(
+              onPressed: () {
+                final today = DateTime.now();
+                _openMoodDialogForDate(
+                    DateTime(today.year, today.month, today.day));
+              },
+              label: const Text('Today\'s mood'),
+              icon: const Icon(Icons.mood),
+            ),
+      body: _birthDate == null
+          ? _buildBirthDateSetup()
+          : _buildLifeGrid(),
+    );
+  }
+
+  Widget _buildBirthDateSetup() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24.0),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Welcome to Life Tracker',
+              style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            const Text(
+              'To start, please enter your date of birth. '
+              'We will generate a grid where each square is one day of your life.',
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 24),
+            ElevatedButton.icon(
+              onPressed: _pickBirthDate,
+              icon: const Icon(Icons.cake),
+              label: const Text('Set birth date'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLifeGrid() {
+    final bd = _birthDate!;
+    final daysLived = livedDays;
+    final totalDays = expectedLifespanDays;
+    final remainingDays = (totalDays - daysLived).clamp(0, totalDays);
+    final progressPercent = (lifeProgress * 100).clamp(0, 100).toStringAsFixed(1);
+
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(12.0),
+          child: Column(
+            children: [
+              Text(
+                'Born: ${DateFormat.yMMMMd().format(bd)}',
+                style: const TextStyle(fontSize: 16),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'You’ve lived $daysLived days out of ~$totalDays '
+                '(${progressPercent}% of an $expectedLifespanYears-year life).',
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Approx. days remaining: $remainingDays',
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(4.0),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                // Make small squares, adjust to screen width
+                const double squareSize = 10.0;
+                final crossAxisCount =
+                    (constraints.maxWidth / (squareSize + 2)).floor().clamp(1, 50);
+
+                return GridView.builder(
+                  itemCount: totalDays,
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: crossAxisCount,
+                    crossAxisSpacing: 2,
+                    mainAxisSpacing: 2,
+                  ),
+                  itemBuilder: (context, index) {
+                    final dayDate = bd.add(Duration(days: index));
+                    final isPastOrToday = index < daysLived;
+                    final key = _formatDate(dayDate);
+                    Color color;
+
+                    if (!isPastOrToday) {
+                      // future days: light grey
+                      color = Colors.grey.shade300;
+                    } else {
+                      final moodIndex = _moods[key];
+                      if (moodIndex == null) {
+                        // lived day, no mood yet
+                        color = Colors.blueGrey.shade200;
+                      } else {
+                        color = moodToColor(intToMood(moodIndex));
+                      }
+                    }
+
+                    return GestureDetector(
+                      onTap: isPastOrToday
+                          ? () => _openMoodDialogForDate(dayDate)
+                          : null,
+                      child: Container(
+                        width: squareSize,
+                        height: squareSize,
+                        decoration: BoxDecoration(
+                          color: color,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ----- Mood dialog (slider) -----
+
+class MoodDialog extends StatefulWidget {
+  final Mood initialMood;
+  final DateTime date;
+
+  const MoodDialog({
+    super.key,
+    required this.initialMood,
+    required this.date,
+  });
+
+  @override
+  State<MoodDialog> createState() => _MoodDialogState();
+}
+
+class _MoodDialogState extends State<MoodDialog> {
+  late double _sliderValue;
+
+  @override
+  void initState() {
+    super.initState();
+    _sliderValue = widget.initialMood.index.toDouble();
+  }
+
+  Mood get _currentMood => Mood.values[_sliderValue.round()];
+
+  @override
+  Widget build(BuildContext context) {
+    final dateString = DateFormat.yMMMMd().format(widget.date);
+
+    return AlertDialog(
+      title: Text('How was $dateString?'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            moodToLabel(_currentMood),
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+              color: moodToColor(_currentMood),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Slider(
+            value: _sliderValue,
+            min: 0,
+            max: (Mood.values.length - 1).toDouble(),
+            divisions: Mood.values.length - 1,
+            label: moodToLabel(_currentMood),
+            onChanged: (value) {
+              setState(() {
+                _sliderValue = value;
+              });
+            },
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Slide to choose your mood for this day.\n'
+            'Color of the day square will match your mood.',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 12),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop<Mood?>(null),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: () => Navigator.of(context).pop<Mood>(_currentMood),
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
+
+// ----- Screen launched from notification: logs today’s mood -----
+
+class MoodForTodayScreen extends StatelessWidget {
+  MoodForTodayScreen({super.key});
+
+  final DateTime _today =
+      DateTime.now().toLocal(); // we’ll normalize to date only in dialog
+
+  @override
+  Widget build(BuildContext context) {
+    final date = DateTime(_today.year, _today.month, _today.day);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Today\'s Mood'),
+      ),
+      body: Center(
+        child: ElevatedButton.icon(
+          icon: const Icon(Icons.mood),
+          label: const Text('Set mood for today'),
+          onPressed: () async {
+            // We navigate back to HomeScreen and open the dialog from there.
+            // Simpler: just pop and rely on floating button. But for now:
+            await showDialog<Mood>(
+              context: context,
+              builder: (context) => MoodDialog(
+                initialMood: Mood.ok,
+                date: date,
+              ),
+            );
+            Navigator.of(context).pop();
+          },
+        ),
+      ),
+    );
+  }
+}
